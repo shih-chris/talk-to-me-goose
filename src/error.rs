@@ -8,6 +8,13 @@ pub enum AppError {
     Audio(String),
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("{provider} transcription failed: {category} (HTTP {status}, code {code})")]
+    ProviderDiagnostic {
+        provider: &'static str,
+        status: u16,
+        category: &'static str,
+        code: &'static str,
+    },
     #[error("platform capability unavailable: {0}")]
     Capability(String),
     #[error("clipboard error: {0}")]

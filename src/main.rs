@@ -325,6 +325,7 @@ impl App {
                 .and_then(|runtime| {
                     runtime.block_on(async move {
                         let api_key = request_config.api_key()?.ok_or_else(|| {
+                            warn!(provider = %request_config.provider.label(), category = "missing_api_key", "transcription could not start");
                             AppError::Provider(format!(
                                 "no API key configured for {}",
                                 request_config.provider.label()

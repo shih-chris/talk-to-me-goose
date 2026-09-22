@@ -114,7 +114,14 @@ pub fn init() -> LoggingState {
 pub fn safe_error(error: &AppError) -> String {
     match error {
         AppError::Provider(_) => "provider error".to_string(),
-        AppError::Http(_) => "HTTP request error".to_string(),
+        AppError::Http(error) => {
+            let category = if error.is_timeout() { "timeout" }
+                else if error.is_connect() { "connection" }
+                else if error.is_body() { "response_body" }
+                else if error.is_decode() { "decode" }
+                else { "request" };
+            format!("HTTP request error: {category}")
+        }
         AppError::Credentials(_) => "credential store error".to_string(),
         _ => sanitize(&error.to_string()),
     }
@@ -205,6 +212,19 @@ mod tests {
         assert!(!safe.contains("secret-value"));
         assert!(!safe.contains("token-value"));
         assert!(safe.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn preserves_structured_provider_diagnostics() {
+        let error = AppError::ProviderDiagnostic {
+            provider: "OpenAI",
+            status: 429,
+            category: "request_rejected",
+            code: "insufficient_quota",
+        };
+        let safe = safe_error(&error);
+        assert!(safe.contains("429"));
+        assert!(safe.contains("insufficient_quota"));
     }
 
     #[test]

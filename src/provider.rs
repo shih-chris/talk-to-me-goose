@@ -152,21 +152,21 @@ impl Transcriber for GeminiTranscriber {
 
 fn parse_openai_response(body: &str) -> AppResult<String> {
     let body: OpenAiResponse = serde_json::from_str(body)
-        .map_err(|error| AppError::Provider(format!("invalid OpenAI response: {error}")))?;
-    normalize_transcript(body.text)
+        .map_err(|_| response_diagnostic("OpenAI", "invalid_response"))?;
+    normalize_transcript(body.text).map_err(|_| response_diagnostic("OpenAI", "empty_transcript"))
 }
 
 fn parse_gemini_response(body: &str) -> AppResult<String> {
     let body: GeminiResponse = serde_json::from_str(body)
-        .map_err(|error| AppError::Provider(format!("invalid Gemini response: {error}")))?;
+        .map_err(|_| response_diagnostic("Gemini", "invalid_response"))?;
     let text = body
         .candidates
         .and_then(|candidates| candidates.into_iter().next())
         .and_then(|candidate| candidate.content)
         .and_then(|content| content.parts)
         .and_then(|parts| parts.into_iter().find_map(|part| part.text))
-        .ok_or_else(|| AppError::Provider("Gemini response contained no transcript".to_string()))?;
-    normalize_transcript(text)
+        .ok_or_else(|| response_diagnostic("Gemini", "missing_transcript"))?;
+    normalize_transcript(text).map_err(|_| response_diagnostic("Gemini", "empty_transcript"))
 }
 
 pub fn transcriber_for(config: &AppConfig) -> AppResult<Box<dyn Transcriber>> {
@@ -181,22 +181,48 @@ pub fn transcriber_for(config: &AppConfig) -> AppResult<Box<dyn Transcriber>> {
 }
 
 async fn provider_response_error(
-    provider: &str,
+    provider: &'static str,
     status: StatusCode,
     response: reqwest::Response,
 ) -> AppError {
     let body = response.text().await.unwrap_or_default();
-    AppError::Provider(format!(
-        "{provider} request failed: {}",
-        provider_error_detail(status, &body)
-    ))
+    AppError::ProviderDiagnostic {
+        provider,
+        status: status.as_u16(),
+        category: "request_rejected",
+        code: safe_provider_code(&body),
+    }
 }
 
-fn provider_error_detail(status: StatusCode, body: &str) -> String {
-    if body.trim().is_empty() {
-        status.to_string()
-    } else {
-        format!("{status}: {}", truncate(body, 300))
+fn response_diagnostic(provider: &'static str, category: &'static str) -> AppError {
+    AppError::ProviderDiagnostic {
+        provider,
+        status: 200,
+        category,
+        code: "none",
+    }
+}
+
+// Only fixed, recognized codes may leave the response parser. Never log arbitrary
+// provider messages or codes: even those fields can contain sensitive payloads.
+fn safe_provider_code(body: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "unknown";
+    };
+    let code = value.pointer("/error/code").and_then(|value| value.as_str())
+        .or_else(|| value.pointer("/error/status").and_then(|value| value.as_str()));
+    match code {
+        Some("insufficient_quota") => "insufficient_quota",
+        Some("invalid_api_key") => "invalid_api_key",
+        Some("rate_limit_exceeded") => "rate_limit_exceeded",
+        Some("model_not_found") => "model_not_found",
+        Some("invalid_value") => "invalid_value",
+        Some("invalid_request_error") => "invalid_request_error",
+        Some("RESOURCE_EXHAUSTED") => "RESOURCE_EXHAUSTED",
+        Some("PERMISSION_DENIED") => "PERMISSION_DENIED",
+        Some("UNAUTHENTICATED") => "UNAUTHENTICATED",
+        Some("INVALID_ARGUMENT") => "INVALID_ARGUMENT",
+        _ => "unknown",
     }
 }
 
@@ -210,21 +236,17 @@ fn normalize_transcript(text: String) -> AppResult<String> {
     Ok(text)
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{io::Write, net::TcpListener, thread, time::Duration};
 
-    use reqwest::{Client, StatusCode};
+    use reqwest::Client;
 
     use crate::{audio::AudioData, error::AppError};
 
     use super::{
         OpenAiTranscriber, Transcriber, normalize_transcript, parse_gemini_response,
-        parse_openai_response, provider_error_detail,
+        parse_openai_response, safe_provider_code,
     };
 
     #[test]
@@ -262,10 +284,21 @@ mod tests {
     }
 
     #[test]
-    fn preserves_auth_error_context_without_secrets() {
-        let detail = provider_error_detail(StatusCode::UNAUTHORIZED, r#"{"error":"invalid key"}"#);
-        assert!(detail.contains("401"));
-        assert!(detail.contains("invalid key"));
+    fn preserves_only_allowlisted_error_codes() {
+        assert_eq!(safe_provider_code(r#"{"error":{"code":"insufficient_quota","message":"secret"}}"#), "insufficient_quota");
+        for body in [r#"{"error":{"code":"secret","message":"private transcript"}}"#, "secret", "{}"] {
+            assert_eq!(safe_provider_code(body), "unknown");
+        }
+    }
+
+    #[test]
+    fn distinguishes_response_failures_without_payloads() {
+        for (body, category) in [("private transcript", "invalid_response"), (r#"{"text":" "}"#, "empty_transcript")] {
+            let error = parse_openai_response(body).unwrap_err().to_string();
+            assert!(error.contains(category));
+            assert!(!error.contains("private transcript"));
+        }
+        assert!(parse_gemini_response("{}").unwrap_err().to_string().contains("missing_transcript"));
     }
 
     #[test]
